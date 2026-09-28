@@ -1,0 +1,26 @@
+{
+  "name": "verificacion-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Servidor de confianza que compara la selfie de un repartidor/dueño de lavandería contra su carnet y aprueba automáticamente en Firestore si coincide.",
+  "main": "index.js",
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "@vladmandic/face-api": "^1.7.15",
+    "canvas": "^2.11.2",
+    "express": "^4.22.3",
+    "google-auth-library": "^9.15.1",
+    "node-fetch": "^2.7.0"
+  },
+  "allowScripts": {
+    "@tensorflow/tfjs-node@4.22.0": true,
+    "canvas@2.11.2": true,
+    "core-js@3.29.1": true
+  }
+}
