@@ -104,17 +104,6 @@ async function firestorePatch(docPath, token, camposJS, mascara) {
   return resp.json();
 }
 
-async function firestorePost(coleccion, token, camposJS) {
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${coleccion}`;
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fields: paraCamposFirestore(camposJS) }),
-  });
-  if (!resp.ok) throw new Error(`POST ${coleccion} → ${resp.status}: ${await resp.text()}`);
-  return resp.json();
-}
-
 // Trae TODOS los documentos de una colección chica (esto es un prototipo de
 // bajo volumen; para una app grande esto habría que paginarlo o indexarlo).
 async function firestoreListarTodo(coleccion, token) {
@@ -292,36 +281,17 @@ app.post('/verificar', async (req, res) => {
     }
 
     if (tipo === 'repartidor') {
+      // El repartidor es de una sola etapa: la cara coincide -> aprobado.
       await firestorePatch(`usuarios/${uid}`, token, { role: 'repartidor' }, ['role']);
       await firestorePatch(`solicitudes_repartidor/${uid}`, token, { estado: 'aprobada' }, ['estado']);
     } else {
-      const lavanderiaPublica = {
-        nombre: solicitud.nombre,
-        direccion: solicitud.direccion,
-        lat: solicitud.lat,
-        lng: solicitud.lng,
-        servicios: solicitud.servicios || [],
-        precios: solicitud.mostrarPrecios ? solicitud.precios || {} : {},
-        costoEnvio: solicitud.costoEnvio || 0,
-        entregaDomicilio: !!solicitud.entregaDomicilio,
-        propietarioUid: uid,
-        fotosBase64: solicitud.fotosBase64 || [],
-        activo: true,
-      };
-      if (solicitud.mostrarPrecios && solicitud.precioDocena != null) {
-        lavanderiaPublica.precioDocena = solicitud.precioDocena;
-      }
-      if (solicitud.mostrarPrecios && solicitud.precioKg != null) {
-        lavanderiaPublica.precioKg = solicitud.precioKg;
-      }
-
-      const nuevoDoc = await firestorePost('lavanderias', token, lavanderiaPublica);
-      const nuevoId = nuevoDoc.name.split('/').pop();
-      await firestorePatch(`usuarios/${uid}`, token, { role: 'admin', lavanderiaId: nuevoId }, [
-        'role',
-        'lavanderiaId',
+      // La lavandería es de dos etapas: esto solo confirma la identidad del
+      // dueño (igual que haría un verificador humano). La creación del local
+      // público y la promoción a admin las hace el superadmin como segunda
+      // etapa, después de revisar el local en sí (ubicación, NIT, fotos).
+      await firestorePatch('solicitudes_lavanderia/' + uid, token, { estado: 'identidadConfirmada' }, [
+        'estado',
       ]);
-      await firestorePatch('solicitudes_lavanderia/' + uid, token, { estado: 'aprobada' }, ['estado']);
     }
 
     res.json({ aprobado: true, distancia: resultado.distancia });
