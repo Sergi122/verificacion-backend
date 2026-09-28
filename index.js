@@ -115,6 +115,80 @@ async function firestorePost(coleccion, token, camposJS) {
   return resp.json();
 }
 
+// Trae TODOS los documentos de una colección chica (esto es un prototipo de
+// bajo volumen; para una app grande esto habría que paginarlo o indexarlo).
+async function firestoreListarTodo(coleccion, token) {
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${coleccion}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!resp.ok) throw new Error(`LIST ${coleccion} → ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  return (data.documents || []).map((doc) => ({
+    id: doc.name.split('/').pop(),
+    datos: paraObjetoJS(doc.fields || {}),
+  }));
+}
+
+// ---- Detección de duplicados (no rechaza sola, solo levanta una alerta
+// para que el verificador y el superadmin la revisen a mano) ----
+
+function distanciaMetros(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const rad = (g) => (g * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1);
+  const dLng = rad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+async function buscarDuplicadosRepartidor(token, uidActual, ci, placaMoto) {
+  const motivos = [];
+  const todos = await firestoreListarTodo('solicitudes_repartidor', token);
+  const otros = todos.filter((r) => r.id !== uidActual && r.datos.estado !== 'rechazada');
+
+  if (ci) {
+    const mismoCi = otros.filter((r) => r.datos.ci === ci);
+    if (mismoCi.length) {
+      motivos.push(`Ya existe otra solicitud de repartidor con el mismo CI (${ci}).`);
+    }
+  }
+  if (placaMoto) {
+    const mismaPlacaOtroCi = otros.filter((r) => r.datos.placaMoto === placaMoto && r.datos.ci !== ci);
+    if (mismaPlacaOtroCi.length) {
+      motivos.push(
+        `Otra persona con CI distinto ya registró la misma placa de moto (${placaMoto}) — posible suplantación.`,
+      );
+    }
+  }
+  return motivos;
+}
+
+async function buscarDuplicadosLavanderia(token, uidActual, nit, lat, lng) {
+  const motivos = [];
+  const todos = await firestoreListarTodo('solicitudes_lavanderia', token);
+  const otros = todos.filter((r) => r.id !== uidActual && r.datos.estado !== 'rechazada');
+
+  if (nit) {
+    const mismoNit = otros.filter((r) => r.datos.nit === nit);
+    if (mismoNit.length) {
+      motivos.push(`Ya existe otra solicitud de lavandería con el mismo NIT (${nit}).`);
+    }
+  }
+  if (typeof lat === 'number' && typeof lng === 'number') {
+    for (const r of otros) {
+      if (typeof r.datos.lat !== 'number' || typeof r.datos.lng !== 'number') continue;
+      const d = distanciaMetros(lat, lng, r.datos.lat, r.datos.lng);
+      if (d < 40) {
+        motivos.push(
+          `Ya hay otra lavandería ("${r.datos.nombre || 'sin nombre'}") registrada a ${Math.round(d)}m de esta ubicación.`,
+        );
+        break;
+      }
+    }
+  }
+  return motivos;
+}
+
 // ---- Comparación facial ----
 
 async function descriptorDeBase64(base64Img) {
@@ -169,6 +243,19 @@ app.post('/verificar', async (req, res) => {
 
     const resultado = await compararCaras(solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64);
 
+    // Duplicados: nunca bloquean solos (podría ser una coincidencia real),
+    // pero si aparece alguno, no se aprueba automático — queda para que un
+    // humano (verificador o superadmin) lo revise a propósito.
+    let motivosDuplicado = [];
+    try {
+      motivosDuplicado =
+        tipo === 'repartidor'
+          ? await buscarDuplicadosRepartidor(token, uid, solicitud.ci, solicitud.placaMoto)
+          : await buscarDuplicadosLavanderia(token, uid, solicitud.nit, solicitud.lat, solicitud.lng);
+    } catch (e) {
+      console.error('No se pudo chequear duplicados (se continúa sin bloquear por esto):', e);
+    }
+
     // Guardamos el resultado siempre (aprobemos o no) para que el verificador
     // humano lo vea como referencia si termina revisando el caso a mano.
     await firestorePatch(
@@ -177,9 +264,24 @@ app.post('/verificar', async (req, res) => {
       {
         verificacionAutomaticaDistancia: resultado.distancia,
         verificacionAutomaticaCoincide: resultado.coincide,
+        posibleDuplicado: motivosDuplicado.length > 0,
+        motivoDuplicado: motivosDuplicado.join(' '),
       },
-      ['verificacionAutomaticaDistancia', 'verificacionAutomaticaCoincide'],
+      [
+        'verificacionAutomaticaDistancia',
+        'verificacionAutomaticaCoincide',
+        'posibleDuplicado',
+        'motivoDuplicado',
+      ],
     );
+
+    if (motivosDuplicado.length > 0) {
+      return res.json({
+        aprobado: false,
+        distancia: resultado.distancia,
+        motivo: `Posible duplicado, requiere revisión humana: ${motivosDuplicado.join(' ')}`,
+      });
+    }
 
     if (!resultado.coincide) {
       return res.json({
