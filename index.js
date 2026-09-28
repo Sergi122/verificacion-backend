@@ -19,6 +19,17 @@ const PORT = process.env.PORT || 3000;
 // para reducir falsos positivos. Ajustar con datos reales una vez en uso.
 const UMBRAL_COINCIDENCIA = 0.5;
 
+// Para repartidor (dos documentos + selfie) se pide explícitamente un % de
+// similitud mínimo, no solo una distancia "suficientemente baja".
+const UMBRAL_SIMILITUD_REPARTIDOR = 70;
+
+// Convierte la distancia euclidiana de face-api a un % de similitud legible
+// (0 = nada parecido, 100 = idéntico). Es una heurística lineal simple,
+// no una probabilidad calibrada — ajustar con datos reales una vez en uso.
+function similitudPorcentaje(distancia) {
+  return Math.max(0, Math.min(100, (1 - distancia) * 100));
+}
+
 const MODEL_DIR = path.join(__dirname, 'node_modules', '@vladmandic', 'face-api', 'model');
 
 let modelosListos = false;
@@ -202,6 +213,62 @@ async function compararCaras(carnetBase64, selfieBase64) {
   return { coincide: distancia <= UMBRAL_COINCIDENCIA, distancia };
 }
 
+// Compara dos fotos cualquiera (documento vs. documento, o documento vs.
+// selfie) y devuelve tanto la distancia cruda como un % de similitud.
+async function compararDosCaras(base64A, base64B, etiquetaA, etiquetaB) {
+  const descA = await descriptorDeBase64(base64A);
+  if (!descA) return { ok: false, motivo: `No se detectó una cara en ${etiquetaA}` };
+
+  const descB = await descriptorDeBase64(base64B);
+  if (!descB) return { ok: false, motivo: `No se detectó una cara en ${etiquetaB}` };
+
+  const distancia = faceapi.euclideanDistance(descA, descB);
+  return { ok: true, distancia, similitud: similitudPorcentaje(distancia) };
+}
+
+// Verificación de repartidor: la selfie (sin casco ni lentes) debe coincidir
+// con el carnet Y con la licencia de conducir (>70% de similitud cada una).
+// Si el carnet y la licencia no parecen ser de la misma persona, es una
+// discrepancia entre documentos y tampoco se aprueba automático.
+async function verificarRepartidor(solicitud) {
+  const selfieVsCarnet = await compararDosCaras(
+    solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64, 'el carnet', 'la selfie',
+  );
+  if (!selfieVsCarnet.ok) return { aprobado: false, motivo: selfieVsCarnet.motivo };
+
+  const selfieVsLicencia = await compararDosCaras(
+    solicitud.licenciaConducirBase64, solicitud.selfieFrenteBase64, 'la licencia de conducir', 'la selfie',
+  );
+  if (!selfieVsLicencia.ok) return { aprobado: false, motivo: selfieVsLicencia.motivo };
+
+  const carnetVsLicencia = await compararDosCaras(
+    solicitud.carnetAnversoBase64, solicitud.licenciaConducirBase64, 'el carnet', 'la licencia de conducir',
+  );
+  if (!carnetVsLicencia.ok) return { aprobado: false, motivo: carnetVsLicencia.motivo };
+
+  const discrepancia = carnetVsLicencia.similitud < UMBRAL_SIMILITUD_REPARTIDOR;
+  const peorSimilitud = Math.min(selfieVsCarnet.similitud, selfieVsLicencia.similitud);
+  const peorDistancia = Math.max(selfieVsCarnet.distancia, selfieVsLicencia.distancia);
+  const coincideSelfie = peorSimilitud >= UMBRAL_SIMILITUD_REPARTIDOR;
+
+  return {
+    aprobado: coincideSelfie && !discrepancia,
+    distancia: peorDistancia,
+    similitud: peorSimilitud,
+    discrepancia,
+    motivoDiscrepancia: discrepancia
+      ? `El carnet y la licencia de conducir no parecen ser de la misma persona `
+        + `(similitud ${carnetVsLicencia.similitud.toFixed(0)}%).`
+      : '',
+    motivo: discrepancia
+      ? 'Discrepancia entre el carnet y la licencia de conducir, requiere revisión humana'
+      : (!coincideSelfie
+        ? `La selfie no coincide lo suficiente con el carnet y/o la licencia `
+          + `(similitud mínima ${peorSimilitud.toFixed(0)}%, se pide al menos ${UMBRAL_SIMILITUD_REPARTIDOR}%)`
+        : ''),
+  };
+}
+
 // ---- Servidor HTTP ----
 
 const app = express();
@@ -216,21 +283,51 @@ app.post('/verificar', async (req, res) => {
     }
 
     const { tipo, uid } = req.body || {};
-    if (!uid || !['repartidor', 'lavanderia'].includes(tipo)) {
-      return res.status(400).json({ error: 'Faltan datos (tipo debe ser repartidor|lavanderia, y uid)' });
+    if (!uid || !['repartidor', 'lavanderia', 'empleado'].includes(tipo)) {
+      return res.status(400).json({ error: 'Faltan datos (tipo debe ser repartidor|lavanderia|empleado, y uid)' });
     }
 
     await cargarModelos();
     const token = await tokenFirestore();
 
-    const coleccion = tipo === 'repartidor' ? 'solicitudes_repartidor' : 'solicitudes_lavanderia';
+    const coleccion = {
+      repartidor: 'solicitudes_repartidor',
+      lavanderia: 'solicitudes_lavanderia',
+      empleado: 'solicitudes_empleado',
+    }[tipo];
     const solicitud = await firestoreGet(`${coleccion}/${uid}`, token);
 
     if (solicitud.estado !== 'pendiente') {
       return res.json({ aprobado: false, motivo: `La solicitud ya está en estado "${solicitud.estado}"` });
     }
 
-    const resultado = await compararCaras(solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64);
+    // El empleado es un caso aparte: la decisión de contratarlo es siempre
+    // del admin de esa lavandería en particular (un match de cara no implica
+    // que quiera contratar a esa persona), así que esto NUNCA aprueba solo
+    // ni cambia el estado — solo deja la comparación como referencia.
+    if (tipo === 'empleado') {
+      const resultado = await compararCaras(solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64);
+      await firestorePatch(
+        `${coleccion}/${uid}`,
+        token,
+        {
+          verificacionAutomaticaDistancia: resultado.distancia,
+          verificacionAutomaticaCoincide: resultado.coincide,
+        },
+        ['verificacionAutomaticaDistancia', 'verificacionAutomaticaCoincide'],
+      );
+      return res.json({
+        aprobado: false,
+        distancia: resultado.distancia,
+        motivo: 'Verificación de referencia guardada; el admin de la lavandería decide la contratación.',
+      });
+    }
+
+    const resultado = tipo === 'repartidor'
+      ? await verificarRepartidor(solicitud)
+      : await compararCaras(solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64);
+    // Normalizamos el nombre del campo "coincide" entre las dos formas de resultado.
+    const coincideSelfie = tipo === 'repartidor' ? resultado.aprobado : resultado.coincide;
 
     // Duplicados: nunca bloquean solos (podría ser una coincidencia real),
     // pero si aparece alguno, no se aprueba automático — queda para que un
@@ -247,22 +344,24 @@ app.post('/verificar', async (req, res) => {
 
     // Guardamos el resultado siempre (aprobemos o no) para que el verificador
     // humano lo vea como referencia si termina revisando el caso a mano.
-    await firestorePatch(
-      `${coleccion}/${uid}`,
-      token,
-      {
-        verificacionAutomaticaDistancia: resultado.distancia,
-        verificacionAutomaticaCoincide: resultado.coincide,
-        posibleDuplicado: motivosDuplicado.length > 0,
-        motivoDuplicado: motivosDuplicado.join(' '),
-      },
-      [
-        'verificacionAutomaticaDistancia',
-        'verificacionAutomaticaCoincide',
-        'posibleDuplicado',
-        'motivoDuplicado',
-      ],
-    );
+    const camposGuardar = {
+      verificacionAutomaticaDistancia: resultado.distancia,
+      verificacionAutomaticaCoincide: coincideSelfie,
+      posibleDuplicado: motivosDuplicado.length > 0,
+      motivoDuplicado: motivosDuplicado.join(' '),
+    };
+    const mascaraGuardar = [
+      'verificacionAutomaticaDistancia',
+      'verificacionAutomaticaCoincide',
+      'posibleDuplicado',
+      'motivoDuplicado',
+    ];
+    if (tipo === 'repartidor') {
+      camposGuardar.discrepanciaDocumentos = !!resultado.discrepancia;
+      camposGuardar.motivoDiscrepancia = resultado.motivoDiscrepancia || '';
+      mascaraGuardar.push('discrepanciaDocumentos', 'motivoDiscrepancia');
+    }
+    await firestorePatch(`${coleccion}/${uid}`, token, camposGuardar, mascaraGuardar);
 
     if (motivosDuplicado.length > 0) {
       return res.json({
@@ -272,7 +371,11 @@ app.post('/verificar', async (req, res) => {
       });
     }
 
-    if (!resultado.coincide) {
+    if (tipo === 'repartidor' && resultado.discrepancia) {
+      return res.json({ aprobado: false, distancia: resultado.distancia, motivo: resultado.motivo });
+    }
+
+    if (!coincideSelfie) {
       return res.json({
         aprobado: false,
         distancia: resultado.distancia,
