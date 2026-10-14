@@ -16,7 +16,8 @@
     "canvas": "^2.11.2",
     "express": "^4.22.3",
     "google-auth-library": "^9.15.1",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "nodemailer": "^10.0.16"
   },
   "allowScripts": {
     "@tensorflow/tfjs-node@4.22.0": true,

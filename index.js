@@ -3,7 +3,7 @@ const express = require('express');
 const canvas = require('canvas');
 const faceapi = require('@vladmandic/face-api');
 require('@tensorflow/tfjs-node'); // registra el backend nativo 'tensorflow' en tfjs
-const { GoogleAuth } = require('google-auth-library');
+const { GoogleAuth, OAuth2Client } = require('google-auth-library');
 const fetch = require('node-fetch');
 
 const { Canvas, Image, ImageData } = canvas;
@@ -189,6 +189,32 @@ async function buscarDuplicadosLavanderia(token, uidActual, nit, lat, lng) {
   return motivos;
 }
 
+// ---- Sesión del usuario (ID token de Firebase) ----
+// La app manda su ID token y se verifica la firma con los certificados
+// públicos de Google. Así no hace falta ningún secreto dentro de la app (se
+// podía extraer del APK o de la web) y nadie puede pedir la verificación de
+// otra persona.
+
+const CERTS_URL = 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+const clienteJwt = new OAuth2Client();
+let certs = { datos: null, vence: 0 };
+
+async function uidDeIdToken(idToken) {
+  if (!idToken) return null;
+  try {
+    if (!certs.datos || Date.now() > certs.vence) {
+      const r = await fetch(CERTS_URL);
+      certs = { datos: await r.json(), vence: Date.now() + 60 * 60 * 1000 };
+    }
+    const ticket = await clienteJwt.verifySignedJwtWithCertsAsync(
+      idToken, certs.datos, PROJECT_ID, [`https://securetoken.google.com/${PROJECT_ID}`],
+    );
+    return ticket.getPayload().sub || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // ---- Comparación facial ----
 
 async function descriptorDeBase64(base64Img) {
@@ -200,6 +226,68 @@ async function descriptorDeBase64(base64Img) {
     .withFaceLandmarks()
     .withFaceDescriptor();
   return deteccion ? deteccion.descriptor : null;
+}
+
+// Giro de la cabeza a partir de los 68 puntos: cuánto se corre la nariz
+// respecto del centro de los ojos, en unidades de distancia entre ojos.
+// De frente ~0; girada ~0.3 o más. Una foto plana (el carnet impreso o en
+// otra pantalla) inclinada no cambia este valor: la nariz no se desplaza.
+function giroDeLandmarks(puntos) {
+  const media = (a, b) => {
+    let x = 0, y = 0;
+    for (let i = a; i <= b; i++) { x += puntos[i].x; y += puntos[i].y; }
+    const n = b - a + 1;
+    return { x: x / n, y: y / n };
+  };
+  const ojoA = media(36, 41), ojoB = media(42, 47);
+  const entreOjos = Math.hypot(ojoB.x - ojoA.x, ojoB.y - ojoA.y) || 1;
+  const nariz = puntos[30];
+  return (nariz.x - (ojoA.x + ojoB.x) / 2) / entreOjos;
+}
+
+async function analizarCara(base64Img) {
+  if (!base64Img) return null;
+  const img = await canvas.loadImage(Buffer.from(base64Img, 'base64'));
+  const d = await faceapi
+    .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+  return d ? { descriptor: d.descriptor, giro: giroDeLandmarks(d.landmarks.positions) } : null;
+}
+
+const GIRO_MINIMO_LATERAL = 0.18;
+const MISMA_PERSONA_SELFIES = 0.6;
+// Una selfie real contra la foto del carnet casi nunca baja de ~0.25; por
+// debajo de esto es la misma imagen (le sacaron foto al carnet).
+const DISTANCIA_COPIA = 0.12;
+
+// Prueba de vida con las tres selfies (frente, izquierda, derecha): las
+// laterales deben ser la misma persona con la cabeza girada a lados
+// opuestos, y la de frente no puede ser una copia del carnet. No rechaza
+// sola: si falla, la solicitud queda para revisión humana.
+async function pruebaDeVida(solicitud) {
+  const frente = await analizarCara(solicitud.selfieFrenteBase64);
+  if (!frente) return { ok: false, motivo: 'No se detectó una cara en la selfie de frente' };
+  const izq = await analizarCara(solicitud.selfieIzquierdaBase64);
+  const der = await analizarCara(solicitud.selfieDerechaBase64);
+  if (!izq || !der) return { ok: false, motivo: 'Faltan las selfies girando la cabeza (o no se detectó la cara)' };
+
+  for (const [lado, cara] of [['izquierda', izq], ['derecha', der]]) {
+    if (faceapi.euclideanDistance(frente.descriptor, cara.descriptor) > MISMA_PERSONA_SELFIES) {
+      return { ok: false, motivo: `La selfie ${lado} no parece la misma persona que la de frente` };
+    }
+  }
+  const giroIzq = izq.giro - frente.giro, giroDer = der.giro - frente.giro;
+  if (Math.abs(giroIzq) < GIRO_MINIMO_LATERAL || Math.abs(giroDer) < GIRO_MINIMO_LATERAL
+      || Math.sign(giroIzq) === Math.sign(giroDer)) {
+    return { ok: false, motivo: 'Las selfies laterales no muestran la cabeza girada a ambos lados (posible foto de una foto)' };
+  }
+
+  const carnet = await analizarCara(solicitud.carnetAnversoBase64);
+  if (carnet && faceapi.euclideanDistance(carnet.descriptor, frente.descriptor) < DISTANCIA_COPIA) {
+    return { ok: false, motivo: 'La selfie es prácticamente idéntica a la foto del carnet' };
+  }
+  return { ok: true, motivo: '' };
 }
 
 async function compararCaras(carnetBase64, selfieBase64) {
@@ -276,13 +364,54 @@ app.use(express.json({ limit: '5mb' }));
 
 app.get('/', (req, res) => res.json({ ok: true }));
 
+// La app web llama a /verificar desde el navegador: sin CORS fallaba siempre.
+app.use('/verificar', (req, res, next) => {
+  res.set({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  });
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// CORS solo para los endpoints de código (la app web los llama desde el navegador).
+app.use('/codigo', (req, res, next) => {
+  res.set({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  });
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+const codigoCorreo = require('./codigo_correo');
+codigoCorreo.registrar({
+  app,
+  fetch,
+  tokenServicio: async (scopes) => {
+    const credentials = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '{}');
+    const cliente = await new GoogleAuth({ credentials, scopes }).getClient();
+    return (await cliente.getAccessToken()).token;
+  },
+  firestoreGet,
+  firestorePatch,
+  apiKey: process.env.FIREBASE_WEB_API_KEY || '',
+  pepper: process.env.CODIGO_PEPPER || SECRETO || 'pepper',
+  transporte: codigoCorreo.crearTransporte(process.env),
+  remitente: process.env.SMTP_FROM || process.env.SMTP_USER || '',
+  projectId: PROJECT_ID,
+});
+
 app.post('/verificar', async (req, res) => {
   try {
-    if (SECRETO && req.headers['x-verificacion-token'] !== SECRETO) {
-      return res.status(401).json({ error: 'No autorizado' });
-    }
-
     const { tipo, uid } = req.body || {};
+    // Solo el propio postulante, con su sesión. (El secreto compartido de
+    // antes iba dentro de la app y quedó expuesto: ya no da acceso.)
+    const idToken = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const uidSesion = await uidDeIdToken(idToken);
+    if (!uidSesion || uidSesion !== uid) return res.status(401).json({ error: 'No autorizado' });
+
     if (!uid || !['repartidor', 'lavanderia', 'empleado'].includes(tipo)) {
       return res.status(400).json({ error: 'Faltan datos (tipo debe ser repartidor|lavanderia|empleado, y uid)' });
     }
@@ -307,14 +436,17 @@ app.post('/verificar', async (req, res) => {
     // ni cambia el estado — solo deja la comparación como referencia.
     if (tipo === 'empleado') {
       const resultado = await compararCaras(solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64);
+      const vidaEmpleado = await pruebaDeVida(solicitud);
       await firestorePatch(
         `${coleccion}/${uid}`,
         token,
         {
           verificacionAutomaticaDistancia: resultado.distancia,
           verificacionAutomaticaCoincide: resultado.coincide,
+          pruebaVidaOk: vidaEmpleado.ok,
+          motivoPruebaVida: vidaEmpleado.motivo,
         },
-        ['verificacionAutomaticaDistancia', 'verificacionAutomaticaCoincide'],
+        ['verificacionAutomaticaDistancia', 'verificacionAutomaticaCoincide', 'pruebaVidaOk', 'motivoPruebaVida'],
       );
       return res.json({
         aprobado: false,
@@ -328,6 +460,7 @@ app.post('/verificar', async (req, res) => {
       : await compararCaras(solicitud.carnetAnversoBase64, solicitud.selfieFrenteBase64);
     // Normalizamos el nombre del campo "coincide" entre las dos formas de resultado.
     const coincideSelfie = tipo === 'repartidor' ? resultado.aprobado : resultado.coincide;
+    const vida = await pruebaDeVida(solicitud);
 
     // Duplicados: nunca bloquean solos (podría ser una coincidencia real),
     // pero si aparece alguno, no se aprueba automático — queda para que un
@@ -349,12 +482,16 @@ app.post('/verificar', async (req, res) => {
       verificacionAutomaticaCoincide: coincideSelfie,
       posibleDuplicado: motivosDuplicado.length > 0,
       motivoDuplicado: motivosDuplicado.join(' '),
+      pruebaVidaOk: vida.ok,
+      motivoPruebaVida: vida.motivo,
     };
     const mascaraGuardar = [
       'verificacionAutomaticaDistancia',
       'verificacionAutomaticaCoincide',
       'posibleDuplicado',
       'motivoDuplicado',
+      'pruebaVidaOk',
+      'motivoPruebaVida',
     ];
     if (tipo === 'repartidor') {
       camposGuardar.discrepanciaDocumentos = !!resultado.discrepancia;
@@ -373,6 +510,10 @@ app.post('/verificar', async (req, res) => {
 
     if (tipo === 'repartidor' && resultado.discrepancia) {
       return res.json({ aprobado: false, distancia: resultado.distancia, motivo: resultado.motivo });
+    }
+
+    if (!vida.ok) {
+      return res.json({ aprobado: false, distancia: resultado.distancia, motivo: `Requiere revisión humana: ${vida.motivo}` });
     }
 
     if (!coincideSelfie) {
@@ -404,4 +545,9 @@ app.post('/verificar', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Verificación automática escuchando en el puerto ${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Verificación automática escuchando en el puerto ${PORT}`));
+}
+
+// Para las pruebas (test_vida.js) sin levantar el servidor.
+module.exports = { app, cargarModelos, analizarCara, pruebaDeVida, uidDeIdToken, giroDeLandmarks };
