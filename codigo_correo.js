@@ -68,13 +68,16 @@ function correoHtml(codigo) {
 }
 
 /**
- * deps: { app, fetch, tokenServicio(scopes), firestoreGet, firestorePatch, apiKey, pepper, transporte, remitente, projectId }
+ * deps: { app, fetch, tokenServicio(scopes), firestoreGet, firestorePatch, usuarioDeIdToken?, apiKey, pepper, transporte, remitente, projectId }
  * Se inyectan para poder probar sin red.
  */
 function registrar(deps) {
   const { app, fetch, tokenServicio, firestoreGet, firestorePatch, apiKey, pepper, transporte, remitente, projectId } = deps;
 
-  async function usuarioDeIdToken(idToken) {
+  // Si index.js pasa su verificador de firma lo usamos; si no, accounts:lookup con la API key.
+  const usuarioDeIdToken = deps.usuarioDeIdToken || usuarioPorLookup;
+
+  async function usuarioPorLookup(idToken) {
     const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

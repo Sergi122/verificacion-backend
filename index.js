@@ -215,6 +215,15 @@ async function uidDeIdToken(idToken) {
   }
 }
 
+// Igual que uidDeIdToken pero con el correo: el ID token ya trae email y
+// email_verified firmados por Google, así no hace falta la API key web.
+async function usuarioDeIdToken(idToken) {
+  const uid = await uidDeIdToken(idToken);
+  if (!uid) return null;
+  const p = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64url').toString());
+  return { uid, email: p.email, verificado: !!p.email_verified };
+}
+
 // ---- Comparación facial ----
 
 async function descriptorDeBase64(base64Img) {
@@ -396,6 +405,7 @@ codigoCorreo.registrar({
   },
   firestoreGet,
   firestorePatch,
+  usuarioDeIdToken: process.env.FIREBASE_WEB_API_KEY ? undefined : usuarioDeIdToken,
   apiKey: process.env.FIREBASE_WEB_API_KEY || '',
   pepper: process.env.CODIGO_PEPPER || SECRETO || 'pepper',
   transporte: codigoCorreo.crearTransporte(process.env, fetch),
