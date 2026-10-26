@@ -398,8 +398,8 @@ codigoCorreo.registrar({
   firestorePatch,
   apiKey: process.env.FIREBASE_WEB_API_KEY || '',
   pepper: process.env.CODIGO_PEPPER || SECRETO || 'pepper',
-  transporte: codigoCorreo.crearTransporte(process.env),
-  remitente: process.env.SMTP_FROM || process.env.SMTP_USER || '',
+  transporte: codigoCorreo.crearTransporte(process.env, fetch),
+  remitente: process.env.CORREO_REMITENTE || process.env.SMTP_FROM || process.env.SMTP_USER || '',
   projectId: PROJECT_ID,
 });
 

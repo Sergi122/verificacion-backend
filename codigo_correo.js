@@ -27,7 +27,29 @@ function evaluarIntento(reg, uid, codigo, pepper, ahora = Date.now()) {
   return { ok: false, motivo: 'incorrecto' };
 }
 
-function crearTransporte(env) {
+// "Nombre <correo@x>" o "correo@x" → { name, email } (formato de la API de Brevo).
+function parsearRemitente(texto) {
+  const m = /^\s*(.*?)\s*<([^>]+)>\s*$/.exec(texto || '');
+  return m ? { name: m[1] || undefined, email: m[2] } : { email: (texto || '').trim() };
+}
+
+/**
+ * Brevo por HTTPS si hay BREVO_API_KEY (Render gratis bloquea los puertos SMTP
+ * 25/465/587 desde sept-2025); si no, SMTP clásico. Ambos exponen sendMail().
+ */
+function crearTransporte(env, fetchImpl = globalThis.fetch) {
+  if (env.BREVO_API_KEY) {
+    return {
+      async sendMail({ from, to, subject, text, html }) {
+        const r = await fetchImpl('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: { 'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ sender: parsearRemitente(from), to: [{ email: to }], subject, textContent: text, htmlContent: html }),
+        });
+        if (!r.ok) throw new Error(`brevo ${r.status} ${await r.text()}`);
+      },
+    };
+  }
   if (!env.SMTP_HOST) return null;
   return nodemailer.createTransport({
     host: env.SMTP_HOST,
@@ -131,4 +153,4 @@ function registrar(deps) {
   });
 }
 
-module.exports = { registrar, generarCodigo, hashCodigo, evaluarIntento, crearTransporte, MAX_INTENTOS };
+module.exports = { registrar, generarCodigo, hashCodigo, evaluarIntento, crearTransporte, parsearRemitente, MAX_INTENTOS };
