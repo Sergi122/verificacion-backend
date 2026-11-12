@@ -129,7 +129,7 @@ async function firestoreListarTodo(coleccion, token) {
 }
 
 // ---- Detección de duplicados (no rechaza sola, solo levanta una alerta
-// para que el verificador y el superadmin la revisen a mano) ----
+// para que el superadmin la revise a mano) ----
 
 function distanciaMetros(lat1, lng1, lat2, lng2) {
   const R = 6371000;
@@ -474,7 +474,7 @@ app.post('/verificar', async (req, res) => {
 
     // Duplicados: nunca bloquean solos (podría ser una coincidencia real),
     // pero si aparece alguno, no se aprueba automático — queda para que un
-    // humano (verificador o superadmin) lo revise a propósito.
+    // humano (el superadmin) lo revise a propósito.
     let motivosDuplicado = [];
     try {
       motivosDuplicado =
@@ -485,8 +485,8 @@ app.post('/verificar', async (req, res) => {
       console.error('No se pudo chequear duplicados (se continúa sin bloquear por esto):', e);
     }
 
-    // Guardamos el resultado siempre (aprobemos o no) para que el verificador
-    // humano lo vea como referencia si termina revisando el caso a mano.
+    // Guardamos el resultado siempre (aprobemos o no) para que el superadmin
+    // lo vea como referencia si termina revisando el caso a mano.
     const camposGuardar = {
       verificacionAutomaticaDistancia: resultado.distancia,
       verificacionAutomaticaCoincide: coincideSelfie,
@@ -538,15 +538,11 @@ app.post('/verificar', async (req, res) => {
       // El repartidor es de una sola etapa: la cara coincide -> aprobado.
       await firestorePatch(`usuarios/${uid}`, token, { role: 'repartidor' }, ['role']);
       await firestorePatch(`solicitudes_repartidor/${uid}`, token, { estado: 'aprobada' }, ['estado']);
-    } else {
-      // La lavandería es de dos etapas: esto solo confirma la identidad del
-      // dueño (igual que haría un verificador humano). La creación del local
-      // público y la promoción a admin las hace el superadmin como segunda
-      // etapa, después de revisar el local en sí (ubicación, NIT, fotos).
-      await firestorePatch('solicitudes_lavanderia/' + uid, token, { estado: 'identidadConfirmada' }, [
-        'estado',
-      ]);
     }
+    // La lavandería no cambia de estado aquí: sigue 'pendiente' con el
+    // resultado de la comparación guardado (verificacionAutomaticaCoincide).
+    // El superadmin la aprueba o la rechaza en un solo paso, después de
+    // revisar la identidad del dueño y el local (ubicación, NIT, fotos).
 
     res.json({ aprobado: true, distancia: resultado.distancia });
   } catch (e) {

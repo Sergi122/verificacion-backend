@@ -1,6 +1,6 @@
 # Verificación automática (repartidor / lavandería)
 
-Servidor chico que compara la selfie de una persona contra la foto de su carnet y, si coincide, la aprueba automáticamente en Firestore (le pone el rol de `repartidor` o `admin`), sin que un verificador humano tenga que revisarla a mano.
+Servidor chico que compara la selfie de una persona contra la foto de su carnet y, si coincide, la aprueba automáticamente en Firestore (le pone el rol de `repartidor` o `admin`), sin que el superadministrador tenga que revisarla a mano.
 
 No usa Firebase Cloud Functions ni el plan Blaze — corre como un Servicio Web normal en [Render](https://render.com) (gratis, sin tarjeta), y habla con Firestore por su API REST usando una llave de administrador (Service Account) que le da permiso para escribir aunque las reglas normales no lo dejarían a un usuario cualquiera. Eso es justamente lo que lo hace seguro: la decisión la toma este servidor de confianza, no el celular de quien se está postulando.
 
