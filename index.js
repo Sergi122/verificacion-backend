@@ -371,7 +371,12 @@ async function verificarRepartidor(solicitud) {
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 
-app.get('/', (req, res) => res.json({ ok: true }));
+// La app lo llama al abrir para despertar el servidor (Render gratis duerme):
+// con CORS para que el navegador no marque error en la consola.
+app.get('/', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.json({ ok: true });
+});
 
 // La app web llama a /verificar desde el navegador: sin CORS fallaba siempre.
 app.use('/verificar', (req, res, next) => {
